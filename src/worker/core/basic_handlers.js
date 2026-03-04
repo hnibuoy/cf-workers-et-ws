@@ -5,10 +5,47 @@ import { wrapPacket, randomU64String } from './crypto.js';
 
 const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
 
-// Record the first registered digest per network name; later mismatched digest will be rejected
-const networkDigestRegistry = new Map();
+// 支持多密码：每个网络名称可以对应多个密码摘要
+const networkDigestRegistry = new Map(); // networkName -> Set of digests
+const networkGroups = new Map(); // networkName:digest -> group metadata
 
-export function handleHandshake(ws, header, payload, types) {
+// 网络组管理功能
+function updateNetworkGroupActivity(groupKey) {
+  const group = networkGroups.get(groupKey);
+  if (group) {
+    group.lastActivity = Date.now();
+    group.peerCount = (group.peerCount || 0) + 1;
+  }
+}
+
+function removeNetworkGroupActivity(groupKey) {
+  const group = networkGroups.get(groupKey);
+  if (group) {
+    group.peerCount = Math.max(0, (group.peerCount || 1) - 1);
+    
+    // 如果网络组没有活跃的对等节点，可以清理（可选）
+    if (group.peerCount === 0 && Date.now() - group.lastActivity > 24 * 60 * 60 * 1000) {
+      // 24小时无活动，清理网络组
+      networkGroups.delete(groupKey);
+      console.log(`Cleaned up inactive network group: ${groupKey}`);
+    }
+  }
+}
+
+function getNetworkGroupsByNetwork(networkName) {
+  const groups = [];
+  for (const [groupKey, group] of networkGroups.entries()) {
+    if (groupKey.startsWith(`${networkName}:`)) {
+      groups.push({
+        groupKey,
+        ...group
+      });
+    }
+  }
+  return groups;
+}
+
+function handleHandshake(ws, header, payload, types) {
   try {
     const req = types.HandshakeRequest.decode(payload);
     try {
@@ -27,22 +64,38 @@ export function handleHandshake(ws, header, payload, types) {
     const clientNetworkName = req.networkName || '';
     const clientDigest = req.networkSecretDigrest ? Buffer.from(req.networkSecretDigrest) : Buffer.alloc(0);
     const digestHex = clientDigest.toString('hex');
-    const existingDigest = networkDigestRegistry.get(clientNetworkName);
-    if (existingDigest && existingDigest !== digestHex) {
-      console.error(`Rejecting handshake from ${req.myPeerId}: digest mismatch for network "${clientNetworkName}" (existing=${existingDigest}, incoming=${digestHex})`);
-      ws.close();
-      return;
+    
+    // 支持多密码：检查该网络名称下是否已存在此密码摘要
+    let existingDigests = networkDigestRegistry.get(clientNetworkName);
+    if (!existingDigests) {
+      existingDigests = new Set();
+      networkDigestRegistry.set(clientNetworkName, existingDigests);
     }
-    if (!existingDigest) {
-      networkDigestRegistry.set(clientNetworkName, digestHex);
+    
+    // 如果密码摘要不为空且不在现有摘要集合中，则创建新的网络组
+    if (digestHex.length > 0 && !existingDigests.has(digestHex)) {
+      existingDigests.add(digestHex);
+      console.log(`Adding new digest for network "${clientNetworkName}": ${digestHex}`);
     }
-    const groupDigest = networkDigestRegistry.get(clientNetworkName) || '';
-    const groupKey = `${clientNetworkName}:${groupDigest}`;
+    
+    // 生成网络组键：网络名称:密码摘要
+    const groupKey = `${clientNetworkName}:${digestHex}`;
+    
+    // 初始化网络组元数据（如果不存在）
+    if (!networkGroups.has(groupKey)) {
+      networkGroups.set(groupKey, {
+        createdAt: Date.now(),
+        peerCount: 0,
+        lastActivity: Date.now()
+      });
+      console.log(`Created new network group: ${groupKey}`);
+    }
     const serverNetworkName = process.env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME || 'public_server';
     const digest = new Uint8Array(32);
 
     ws.domainName = clientNetworkName;
 
+    // 修复握手响应格式：确保所有字段正确设置
     const respPayload = {
       magic: MAGIC,
       myPeerId: MY_PEER_ID,
@@ -51,11 +104,23 @@ export function handleHandshake(ws, header, payload, types) {
       networkName: serverNetworkName,
       networkSecretDigrest: digest
     };
+    
+    console.log(`Handshake response payload:`, {
+      magic: respPayload.magic,
+      myPeerId: respPayload.myPeerId,
+      version: respPayload.version,
+      features: respPayload.features,
+      networkName: respPayload.networkName,
+      networkSecretDigrestLength: respPayload.networkSecretDigrest ? respPayload.networkSecretDigrest.length : 0
+    });
 
     ws.groupKey = groupKey;
     ws.peerId = req.myPeerId;
     const pm = getPeerManager();
     pm.addPeer(req.myPeerId, ws);
+    
+    // 更新网络组活动状态
+    updateNetworkGroupActivity(groupKey);
     pm.updatePeerInfo(ws.groupKey, req.myPeerId, {
       peerId: req.myPeerId,
       version: 1,
@@ -68,7 +133,24 @@ export function handleHandshake(ws, header, payload, types) {
 
     const respBuffer = types.HandshakeRequest.encode(respPayload).finish();
     const respHeader = createHeader(MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer.length);
-    ws.send(Buffer.concat([respHeader, Buffer.from(respBuffer)]));
+    
+    // 改进发送逻辑：添加延迟确保客户端准备好接收
+    setTimeout(() => {
+      try {
+        // 检查连接状态
+        if (ws.readyState !== WS_OPEN) {
+          console.error(`WebSocket not open when sending handshake response to ${req.myPeerId}, state: ${ws.readyState}`);
+          return;
+        }
+        
+        ws.send(Buffer.concat([respHeader, Buffer.from(respBuffer)]));
+        console.log(`Handshake response sent to peer ${req.myPeerId}, payload length: ${respBuffer.length}`);
+      } catch (sendError) {
+        console.error(`Failed to send handshake response to ${req.myPeerId}:`, sendError);
+        // 不立即关闭连接，让心跳机制处理
+      }
+    }, 10); // 10ms延迟确保客户端准备好
+    
     if (!ws.serverSessionId) {
       ws.serverSessionId = randomU64String();
     }
@@ -90,16 +172,20 @@ export function handleHandshake(ws, header, payload, types) {
 
   } catch (e) {
     console.error('Handshake error:', e);
-    ws.close();
+    // 改进错误处理：只在严重错误时关闭连接
+    if (e.message && e.message.includes('decode') || e.message.includes('Invalid')) {
+      ws.close();
+    }
+    // 其他错误不关闭连接，让心跳机制处理
   }
 }
 
-export function handlePing(ws, header, payload) {
+function handlePing(ws, header, payload) {
   const msg = wrapPacket(createHeader, MY_PEER_ID, header.fromPeerId, PacketType.Pong, payload, ws);
   ws.send(msg);
 }
 
-export function handleForwarding(sourceWs, header, fullMessage, types) {
+function handleForwarding(sourceWs, header, fullMessage, types) {
   const targetPeerId = header.toPeerId;
   const pm = getPeerManager();
   const targetWs = pm.getPeerWs(targetPeerId, sourceWs && sourceWs.groupKey);
@@ -124,3 +210,12 @@ export function handleForwarding(sourceWs, header, fullMessage, types) {
   } else {
   }
 }
+
+export {
+  handleHandshake,
+  handlePing,
+  handleForwarding,
+  updateNetworkGroupActivity,
+  removeNetworkGroupActivity,
+  getNetworkGroupsByNetwork
+};
