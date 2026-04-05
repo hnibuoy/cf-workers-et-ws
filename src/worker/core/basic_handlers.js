@@ -1,3 +1,18 @@
+/**
+ * EasyTier 基础消息处理器
+ * 
+ * 本文件实现了握手处理、私有网络支持和网络组管理功能
+ * 核心改进：实现私有模式拦截和更好的客户端兼容性
+ * 
+ * 核心功能：
+ * - 私有网络支持：通过环境变量配置私有网络名
+ * - 握手协议优化：移除features字段提升兼容性
+ * - 网络组管理：支持多密码和网络组活动状态跟踪
+ * 
+ * @file basic_handlers.js
+ * @version 2.0.0
+ */
+
 import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
 import { getPeerManager } from './peer_manager.js';
@@ -48,20 +63,29 @@ function getNetworkGroupsByNetwork(networkName) {
 function handleHandshake(ws, header, payload, types) {
   try {
     const req = types.HandshakeRequest.decode(payload);
-    try {
-      const dig = req.networkSecretDigrest ? Buffer.from(req.networkSecretDigrest) : Buffer.alloc(0);
-      console.log(`Handshake networkSecretDigest(hex)=${dig.toString('hex')}`);
-    } catch (_) {
-      // ignore
-    }
 
     if (req.magic !== MAGIC) {
-      console.error('Invalid magic');
       ws.close();
       return;
     }
 
     const clientNetworkName = req.networkName || '';
+    
+    // 【新增功能】：私有模式拦截
+    // 如果 Worker 配置了私有网络名，且客户端请求的网络名不一致，直接拒绝连接
+    const privateNetworkName = process.env.EASYTIER_NETWORK_NAME || '';
+    if (privateNetworkName && clientNetworkName !== privateNetworkName) {
+      console.error(`[Private Mode] Rejected: Expected ${privateNetworkName}, got ${clientNetworkName}`);
+      ws.close(1008, "Network name mismatch");
+      return;
+    }
+
+    // 根据是否配置了私有网络名，判断是否为公开服务器
+    const isPublicServer = !privateNetworkName;
+    const serverNetworkName = privateNetworkName || process.env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME || 'public_server';
+
+    // ... (中间的 networkDigestRegistry 等逻辑保持原版不变) ...
+
     const clientDigest = req.networkSecretDigrest ? Buffer.from(req.networkSecretDigrest) : Buffer.alloc(0);
     const digestHex = clientDigest.toString('hex');
     
@@ -90,26 +114,22 @@ function handleHandshake(ws, header, payload, types) {
       });
       console.log(`Created new network group: ${groupKey}`);
     }
-    const serverNetworkName = process.env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME || 'public_server';
-    const digest = new Uint8Array(32);
 
     ws.domainName = clientNetworkName;
 
-    // 修复握手响应格式：确保所有字段正确设置
+    // 【关键修复 5】：移除 features 字段，防止官方客户端严格校验导致拒收
     const respPayload = {
       magic: MAGIC,
       myPeerId: MY_PEER_ID,
       version: VERSION,
-      features: ["node-server-v1"],
       networkName: serverNetworkName,
-      networkSecretDigrest: digest
+      networkSecretDigrest: new Uint8Array(32) // 注意这里官方 proto 拼写是 Digrest
     };
     
     console.log(`Handshake response payload:`, {
       magic: respPayload.magic,
       myPeerId: respPayload.myPeerId,
       version: respPayload.version,
-      features: respPayload.features,
       networkName: respPayload.networkName,
       networkSecretDigrestLength: respPayload.networkSecretDigrest ? respPayload.networkSecretDigrest.length : 0
     });
@@ -128,7 +148,8 @@ function handleHandshake(ws, header, payload, types) {
       instId: { part1: 0, part2: 0, part3: 0, part4: 0 },
       networkLength: Number(process.env.EASYTIER_NETWORK_LENGTH || 24),
     });
-    pm.setPublicServerFlag(true);
+    // 【修改】：使用动态的公开服务器标志
+    pm.setPublicServerFlag(isPublicServer);
     ws.crypto = { enabled: false };
 
     const respBuffer = types.HandshakeRequest.encode(respPayload).finish();
