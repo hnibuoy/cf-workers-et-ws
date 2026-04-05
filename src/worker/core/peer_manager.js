@@ -1,3 +1,18 @@
+/**
+ * EasyTier 对等节点管理器
+ * 
+ * 本文件实现了对等节点管理、路由同步和连接位图生成功能
+ * 核心改进：引入基于时间戳的全局单调递增版本号，彻底解决路由版本污染问题
+ * 
+ * 核心修复：
+ * - 全局单调递增版本号：防止Worker重启或P2P交叉污染导致的版本回退
+ * - 强制版本同步：所有peer使用统一的全局版本号，确保客户端必须接收新路由
+ * - 拓扑签名简化：签名只基于拓扑结构本身，不包含错误的独立版本号
+ * 
+ * @file peer_manager.js
+ * @version 2.0.0
+ */
+
 import { Buffer } from 'buffer';
 import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
@@ -41,12 +56,17 @@ function deriveSameNetworkIpv4(peerAddr, networkLength, myPeerId) {
   return (net | host) >>> 0;
 }
 
+// 生成安全的 32位无符号整数
+function randomUint32() {
+  return Math.floor(Math.random() * 4294967296);
+}
+
 function makeInstId() {
   return {
-    part1: Number(BigInt.asUintN(32, BigInt(randomU64String()))),
-    part2: Number(BigInt.asUintN(32, BigInt(randomU64String()))),
-    part3: Number(BigInt.asUintN(32, BigInt(randomU64String()))),
-    part4: Number(BigInt.asUintN(32, BigInt(randomU64String()))),
+    part1: randomUint32(),
+    part2: randomUint32(),
+    part3: randomUint32(),
+    part4: randomUint32(),
   };
 }
 
@@ -525,20 +545,33 @@ export class PeerManager {
       }
       
       console.log(`[ConnBitmap] Created full-mesh connectivity for ${peerIdVersions.length} peers`);
-      const bitmapBuf = Buffer.from(bitmap);
-      const sig = `${peerIdVersions.map(p => `${p.peerId}:${p.version}`).join(',')}|${bitmapBuf.toString('hex')}`;
-      const connVersion = session.connBitmapVerMap.get(targetPeerId) || 0;
-      const nextConnVersion = connVersion || Math.max(...peerIdVersions.map(p => p.version));
       
-      // 强制推送或签名变化时生成新的连接位图
-      if (forceFullLocal || sig !== session.lastConnBitmapSig) {
-        session.connBitmapVerMap.set(targetPeerId, nextConnVersion);
-        session.lastConnBitmapSig = sig;
-        connBitmap = { peerIds: peerIdVersions, bitmap: bitmapBuf, version: nextConnVersion };
-        console.log(`[ConnBitmap] Generated new bitmap for peer ${targetPeerId}, forceFull=${forceFullLocal}`);
-      } else {
-        console.log(`[ConnBitmap] Using cached bitmap for peer ${targetPeerId}, sig unchanged`);
+      // --- 替换开始 ---
+      // 【核心修复】：引入基于时间戳的全局单调递增版本号，防止 Worker 重启或 P2P 交叉污染导致的版本回退
+      if (typeof this.globalNetworkVersion === 'undefined') {
+          // 初始化为当前秒数 (截断防止溢出 u32)，确保它比客户端当前所有的旧缓存版本都要大
+          this.globalNetworkVersion = Math.floor(Date.now() / 1000) % 2000000000;
       }
+
+      const bitmapBuf = Buffer.from(bitmap);
+      // 签名不再包含本地错误的独立版本号，只根据拓扑结构本身计算
+      const sig = `${peerIdVersions.map(p => p.peerId).join(',')}|${bitmapBuf.toString('hex')}`;
+      
+      // 只要网络拓扑发生任何变动，或者强制推送时，全局版本号 +1
+      if (forceFullLocal || sig !== session.lastConnBitmapSig) {
+          this.globalNetworkVersion += 1;
+          session.lastConnBitmapSig = sig;
+          console.log(`[ConnBitmap] Topology changed, global version bumped to: ${this.globalNetworkVersion}`);
+      }
+
+      const currentVersion = this.globalNetworkVersion;
+      // 将所有 peer 的版本号强制刷为最新的全局版本号
+      for (let i = 0; i < peerIdVersions.length; i++) {
+          peerIdVersions[i].version = currentVersion;
+      }
+
+      connBitmap = { peerIds: peerIdVersions, bitmap: bitmapBuf, version: currentVersion };
+      // --- 替换结束 ---
     }
 
     const foreignNetworkInfos = (() => {
@@ -556,6 +589,7 @@ export class PeerManager {
             foreignPeerIds: Array.from(allPeers),
             lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
             version,
+            // 【关键修复 6】：必须严格传入 32 字节的全 0 Buffer，官方 proto 定义这里是 bytes network_secret_digest 
             networkSecretDigest: Buffer.alloc(32),
             myPeerIdForThisNetwork: MY_PEER_ID
           }
