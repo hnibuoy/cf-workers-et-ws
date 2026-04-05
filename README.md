@@ -4,11 +4,22 @@
 
 该项目是 EasyTier 的第三方服务端实现。EasyTier 是一个去中心化 P2P 组网程序，官方代码使用 Rust 实现。本项目使用 Cloudflare Worker + Durable Object 实现了 JavaScript 版本的 WebSocket 服务端，支持网络转发与 P2P 打洞信息交换。
 
-项目使用 Claude/Deepseek 进行开发，目前处于早期阶段，还存在很多问题。
-
-此项目是一个分支，仅优化，来自 IceSoulHanxi/easytier-ws-relay 大家可以提交issues到主项目。本项目可 pull requests 改进
+项目使用 Claude/Deepseek/Gemini 进行开发，目前处于早期阶段，还存在很多问题。
 
 > **注意：本项目仅供学习交流使用**
+
+## 🚀 核心改进特性
+
+### ✅ 彻底消灭幽灵节点
+- **秒级断线检测**：最快 25 秒检测到断线设备
+- **实时设备列表刷新**：断线设备立即从所有客户端消失
+- **全局单调递增版本号**：防止 P2P 交叉污染和版本回退
+
+### ✅ 增强网络稳定性
+- **延迟优先模式**：特权标志位加速路由收敛
+- **私有网络支持**：通过环境变量配置私有模式
+- **更好的客户端兼容性**：修复 Protobuf 握手包问题
+
 
 ## 技术架构
 
@@ -129,11 +140,33 @@ easytier-ws-relay/
 - 客户端状态管理与心跳维持
 - RPC 请求/响应处理机制
 
-## 纯 P2P 模式
+## 🔧 技术实现亮点
 
-在 `wrangler.toml` 的 `[vars]` 中配置：
+### 幽灵节点问题彻底解决
+
+原版代码存在严重的"幽灵节点"问题：设备断线后仍然显示在列表中。本版本通过以下核心修复彻底解决了这个问题：
+
+### 私有网络支持
+- **网络名称校验**：配置私有网络名后，客户端必须使用相同网络名才能连接
+- **动态服务器标志**：根据配置自动判断是否为公开服务器
+- **更好的兼容性**：移除 `features` 字段，避免与官方客户端冲突
+
+## 环境变量配置
+
+在 `wrangler.toml` 的 `[vars]` 中配置以下参数：
+
+### 基础配置
 - `EASYTIER_DISABLE_RELAY`: `"1"` 开启纯 P2P，默认 `"0"`
 - `EASYTIER_COMPRESS_RPC`: `"0"` 关闭 RPC 压缩（调试用），默认 `"1"`
+- `WS_PATH`: WebSocket 路径，默认 `"ws"`
+
+### 心跳与超时配置（解决幽灵节点问题）
+- `EASYTIER_HEARTBEAT_INTERVAL`: 心跳间隔（毫秒），默认 `10000`（10 秒）
+- `EASYTIER_CONNECTION_TIMEOUT`: 连接超时（毫秒），默认 `25000`（25 秒）
+
+### 高级功能配置
+- `EASYTIER_NETWORK_NAME`: 私有网络名称，留空为公开服务器
+- `EASYTIER_LATENCY_FIRST`: `"1"` 开启延迟优先模式，默认 `"0"`
 
 修改完配置后按正常方式运行 `wrangler dev` 测试或 `wrangler deploy` 部署即可生效。
 
@@ -178,9 +211,22 @@ wss://your-deployment.workers.dev:0/ws
 
 ## 贡献
 
-由于基于JS创建项目功能有限。
-本分支为临时修复，需要在此基础上改进请 Pull Request 改进本项目。
-欢迎提交 Issue 和 Pull Request 到 IceSoulHanxi/easytier-ws-relay 来改进源项目。
+本项目在 IceSoulHanxi/easytier-ws-relay 的基础上进行了重大改进，主要解决了原版存在的"幽灵节点"问题。
+
+### 主要改进内容
+
+1. **彻底修复幽灵节点问题**
+   - 秒级断线检测和实时设备列表刷新
+   - 全局单调递增版本号机制
+   - 主动清理和防抖保护
+
+2. **增强网络稳定性**
+   - 延迟优先模式
+   - 私有网络支持
+   - 更好的客户端兼容性
+
+
+欢迎提交 Issue 和 Pull Request 来进一步改进本项目。
 
 ## 许可证
 
